@@ -114,7 +114,8 @@ const Sfx = {
   levelup() { tone(600, 0.14, 'triangle', 0.10, 1200); tone(900, 0.20, 'triangle', 0.07, 1500); },
   bossWarn() { tone(140, 0.5, 'sawtooth', 0.12, 90); tone(200, 0.6, 'square', 0.06, 120); },
   theme() { tone(440, 0.25, 'sine', 0.05, 660); },
-  combo(n) { tone(520 + Math.min(n, 20) * 70, 0.09, 'triangle', 0.05, 900 + Math.min(n, 20) * 70); }
+  combo(n) { tone(520 + Math.min(n, 20) * 70, 0.09, 'triangle', 0.05, 900 + Math.min(n, 20) * 70); },
+  perk() { tone(520, 0.12, 'triangle', 0.08, 780); tone(780, 0.24, 'triangle', 0.06, 1180); }
 };
 
 /* ============================== 输入（双人接口预留） ==============================
@@ -170,6 +171,11 @@ function onPointerDown(e) {
   }
   if (state === 'garage') { garageTap(g); return; }
   if (state === 'playing') {
+    if (perkChoice) {                                  // 选词条时点卡片即选，点空白仍可继续拖拽
+      for (let i = 0; i < perkChoice.options.length; i++) {
+        if (inRect(g, perkCardRect(i))) { applyPerk(i); return; }
+      }
+    }
     if (inRect(g, btnTopLeft)) { state = 'paused'; return; }
     touchActive = true; touchX = g.x; touchY = g.y;
   } else if (state === 'paused') {
@@ -322,6 +328,8 @@ class Player {
     this.wingmen = 0;                                      // 僚机数量 0~2
     this.wingCd = 0;
     this.wings = [ { x: this.x, y: this.y }, { x: this.x, y: this.y } ];
+    this.extraShot = 0;                                    // 局内词条：主炮额外发数
+    this.perkLog = [];                                     // 已获得词条（HUD 展示）
   }
   update(dt) {
     if (!this.alive) return;
@@ -384,6 +392,10 @@ class Player {
     else if (lvl === 2) shots = [{ ox: -7, a: 0 }, { ox: 7, a: 0 }];
     else if (lvl === 3) shots = [{ ox: 0, a: 0 }, { ox: -10, a: -0.17 }, { ox: 10, a: 0.17 }];
     else                shots = [{ ox: -7, a: 0 }, { ox: 7, a: 0 }, { ox: -14, a: -0.24 }, { ox: 14, a: 0.24 }, { ox: 0, a: 0 }];
+    for (let k = 0; k < this.extraShot; k++) {          // 局内词条「连·散射」：斜向补弹
+      const side = (k % 2 === 0) ? 1 : -1;
+      shots.push({ ox: side * (16 + Math.floor(k / 2) * 8), a: side * 0.30 });
+    }
     const spd = 680;
     const dmg = 1 + this.dmgBonus + this.dmgRun + this.shipDmg;
     for (const s of shots) {
@@ -491,12 +503,27 @@ const ENEMY_TYPES = {
   boss:     { r: 56, hp: 200, score: 500, speed: 46  }
 };
 
-/* 妖王图鉴：按关卡轮换，招式与走位各异 */
+/* 妖王图鉴：出场随机（不连开同一只），招式由招式池随机抽取，走位各异 */
 const BOSS_TYPES = [
-  { name: '墨龟', kind: 'turtle',    r: 56, hp: 200, score: 500, speed: 46, move: 'bob',    moves: ['arc', 'ring', 'homing'] },
-  { name: '赤蛟', kind: 'dragon',    r: 52, hp: 240, score: 560, speed: 62, move: 'sweepX', moves: ['burst', 'fan', 'sweep']   },
-  { name: '幽蝶', kind: 'butterfly', r: 50, hp: 285, score: 620, speed: 40, move: 'drift',  moves: ['spiral', 'ring', 'fan']  }
+  { name: '墨龟', kind: 'turtle',    r: 56, hp: 200, score: 500, speed: 46, move: 'bob'    },
+  { name: '赤蛟', kind: 'dragon',    r: 52, hp: 240, score: 560, speed: 62, move: 'sweepX' },
+  { name: '幽蝶', kind: 'butterfly', r: 50, hp: 285, score: 620, speed: 40, move: 'drift'  }
 ];
+/* 招式池：每次召唤从池里随机抽 3~4 招，同一个 Boss 每局的手感都不一样。
+   Boss 的「身份」保留在外观、名字和移动轨迹（move）上，招式不再写死。 */
+const BOSS_MOVE_POOL = ['arc', 'ring', 'fan', 'homing', 'burst', 'sweep', 'spiral'];
+let lastBossIdx = -1;                                    // 避免连续两关碰上同一只
+function rollBossMoves() {
+  const bag = BOSS_MOVE_POOL.slice();
+  const n = 3 + (Math.random() < 0.45 ? 1 : 0);          // 3~4 招
+  const out = [];
+  for (let i = 0; i < n && bag.length; i++) {
+    const j = Math.floor(Math.random() * bag.length);
+    out.push(bag[j]);
+    bag.splice(j, 1);
+  }
+  return out;
+}
 
 function hpScale() { return 1 + (stage - 1) * 0.32 + Math.min(elapsed * 0.003, 1.2); }   // 敌机血量随关卡上升
 
@@ -519,7 +546,12 @@ function makeEnemy(type, x, y) {
 }
 
 function spawnBoss() {
-  const bt = BOSS_TYPES[(stage - 1) % BOSS_TYPES.length];
+  let bi = Math.floor(Math.random() * BOSS_TYPES.length);              // 出场随机，不再按关卡轮换
+  if (BOSS_TYPES.length > 1 && bi === lastBossIdx) {                   // 但不连开同一只
+    bi = (bi + 1 + Math.floor(Math.random() * (BOSS_TYPES.length - 1))) % BOSS_TYPES.length;
+  }
+  lastBossIdx = bi;
+  const bt = BOSS_TYPES[bi];
   const hp = Math.round(bt.hp * (1 + (stage - 1) * 0.35));
   const e = {
     type: 'boss', cfg: ENEMY_TYPES.boss, boss: bt,
@@ -527,7 +559,8 @@ function spawnBoss() {
     r: bt.r, hp: hp, maxHp: hp,
     t: 0, fireCd: 1.4, speed: bt.speed, score: bt.score, flash: 0,
     shield: 0, maxShield: 0, isBoss: true, entered: false, dir: 1,
-    mv: 0, mvTimer: 3.2, spiral: 0
+    mv: 0, mvTimer: 3.2, spiral: 0,
+    moves: rollBossMoves()                                             // 本次召唤随机抽到的招式
   };
   enemies.push(e);
   bossActive = true;
@@ -598,7 +631,7 @@ function updateEnemy(e, dt) {
         e.y = 140 + Math.sin(e.t * 1.1) * 18;
       }
       e.mvTimer -= dt;
-      if (e.mvTimer <= 0) { e.mv = (e.mv + 1) % bt.moves.length; e.mvTimer = 3.2; e.fireCd = 0.35; }
+      if (e.mvTimer <= 0) { e.mv = (e.mv + 1) % e.moves.length; e.mvTimer = 3.2; e.fireCd = 0.35; }
       e.fireCd -= dt;
       if (e.fireCd <= 0) bossAttack(e);
     }
@@ -670,7 +703,7 @@ function updateEnemy(e, dt) {
 
 /* 妖王招式派发 */
 function bossAttack(e) {
-  const m = e.boss.moves[e.mv];
+  const m = e.moves[e.mv];
   if (m === 'arc') { emitFan(e.x, e.y, 15, 2.6, 175); e.fireCd = 1.4; }
   else if (m === 'ring') { emitRing(e.x, e.y, 18, 165); e.fireCd = 1.5; }
   else if (m === 'fan') { emitFan(e.x, e.y + 34, 7, 1.0, 210); e.fireCd = 1.0; }
@@ -873,6 +906,59 @@ function collectItem(p, it) {
     const label = (it.type === 'homing') ? '追踪弹' : (it.type === 'laser') ? '激光' : (it.type === 'wing') ? '僚机' : ITEM_DEFS[it.type].icon;
     addFloater(it.x, it.y - 6, label, ITEM_DEFS[it.type].color);
   }
+  Sfx.pickup();
+}
+
+/* ============================== 局内词条（三选一） ==============================
+   触发点刻意保持低频：只在「击破妖王」后弹一次，平均一关一次。
+   弹出时不暂停、只把游戏放慢到 PERK_SLOW 倍速，选项压在中部，
+   6 秒不选自动取第一项，所以它不会卡住流程，也不会在躲弹幕的中途打断操作。 */
+const PERK_TIME = 6.0;                 // 选择窗口（真实秒）
+const PERK_SLOW = 0.2;                 // 慢放倍速（不是暂停）
+const PERK_CARD_W = 141, PERK_CARD_H = 150, PERK_CARD_GAP = 12, PERK_CARD_X0 = 16, PERK_CARD_Y = 300;
+function perkCardRect(i) {
+  return { x: PERK_CARD_X0 + i * (PERK_CARD_W + PERK_CARD_GAP), y: PERK_CARD_Y, w: PERK_CARD_W, h: PERK_CARD_H };
+}
+const PERKS = [
+  { name: '连·散射', desc: '主炮 +1 发',        apply: (p) => { p.extraShot += 1; } },
+  { name: '烈·弹伤', desc: '弹伤 +1',           apply: (p) => { p.dmgRun += 1; } },
+  { name: '韧·生命', desc: '生命 +1',           avail: (p) => p.lives < 12,  apply: (p) => { p.lives += 1; } },
+  { name: '僚·援',   desc: '僚机 +1（上限 2）', avail: (p) => p.wingmen < 2, apply: (p) => { p.wingmen = Math.min(2, p.wingmen + 1); } },
+  { name: '御·盾',   desc: '立刻获得护盾',      apply: (p) => { p.shield = 6; } },
+  { name: '疾·机动', desc: '移动速度 +12%',     apply: (p) => { p.speed *= 1.12; } },
+  { name: '会·心',   desc: '暴击率 +10%',       avail: (p) => p.crit < 0.7,  apply: (p) => { p.crit += 0.10; } },
+  { name: '迅·射速', desc: '射速 +12%',         apply: (p) => { p.rateMul = Math.max(0.35, p.rateMul * 0.88); } },
+  { name: '追·导弹', desc: '追踪弹 +6 秒',      apply: (p) => { p.homing = Math.min(15, p.homing + 6); } },
+  { name: '激·激光', desc: '激光 +6 秒',        apply: (p) => { p.laser = Math.min(12, p.laser + 6); } }
+];
+let perkChoice = null;                 // { options:[词条下标 x3], t:剩余秒 }；null = 未在选词条
+
+function openPerkChoice() {
+  const p = players[0];
+  if (!p) return;
+  const bag = PERKS.filter((k) => !k.avail || k.avail(p));
+  if (bag.length < 3) return;
+  const options = [];
+  for (let i = 0; i < 3; i++) {
+    const j = Math.floor(Math.random() * bag.length);
+    options.push(PERKS.indexOf(bag[j]));            // 三个不重复的词条
+    bag.splice(j, 1);
+  }
+  perkChoice = { options: options, t: PERK_TIME };
+  Sfx.perk();
+}
+
+function applyPerk(slot) {
+  if (!perkChoice || slot < 0 || slot >= perkChoice.options.length) return;
+  const perk = PERKS[perkChoice.options[slot]];
+  perkChoice = null;
+  for (const p of players) {
+    if (!p.alive) continue;
+    perk.apply(p);
+    p.perkLog.push(perk.name);
+  }
+  addFloater(W / 2, PERK_CARD_Y + PERK_CARD_H / 2, perk.name + ' · 得', VERMILION_HI);
+  addShockwave(W / 2, PERK_CARD_Y + PERK_CARD_H / 2, VERMILION_HI, 130);
   Sfx.pickup();
 }
 
@@ -1165,6 +1251,7 @@ function killEnemy(e, index) {
     const drops = ['exp', 'exp', 'shield', 'homing', 'laser'];
     for (let k = 0; k < drops.length; k++) items.push({ x: e.x + rand(-46, 46), y: e.y, type: drops[k], r: 10, t: rand(0, 6), speed: 80 });
     Sfx.bomb();
+    openPerkChoice();                                    // 妖王伏诛 → 局内词条三选一（唯一触发点）
     return;
   }
 
@@ -1459,6 +1546,12 @@ function drawHUD() {
   ctx.fillText('第 ' + stage + ' 关 · 第 ' + wave + '/' + WAVES_PER_STAGE + ' 波', 20, 70);
   const p0 = players[0];
   if (p0) {
+    if (p0.perkLog && p0.perkLog.length) {              // 本局已获得的词条
+      ctx.fillStyle = 'rgba(27,27,32,0.6)';
+      ctx.font = '12px "STKaiti","KaiTi",serif';
+      ctx.textAlign = 'left';
+      for (let i = 0; i < Math.min(6, p0.perkLog.length); i++) ctx.fillText('· ' + p0.perkLog[i], 20, 134 + i * 17);
+    }
     for (let i = 0; i < Math.max(0, p0.lives); i++) {
       ctx.beginPath();
       ctx.fillStyle = VERMILION;
@@ -1582,6 +1675,63 @@ function drawBossUI() {
     ctx.fillText('妖 王 来 袭', W / 2, H / 2 - 40);
     ctx.restore();
   }
+}
+
+/* 局内词条三选一：不遮住顶部来敌区，也不压住下方战机，落在画面中部 */
+function drawPerkChoice() {
+  const pc = perkChoice;
+  if (!pc) return;
+  ctx.save();
+  ctx.fillStyle = 'rgba(242,235,221,0.22)';         // 淡纸色罩，让卡片浮起来
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = INK;
+  ctx.font = '700 22px "STKaiti","KaiTi",serif';
+  glow(VERMILION_HI, 8);
+  ctx.fillText('择一而强', W / 2, PERK_CARD_Y - 26);
+  noGlow();
+  for (let i = 0; i < pc.options.length; i++) {
+    const r = perkCardRect(i);
+    const perk = PERKS[pc.options[i]];
+    ctx.save();
+    ctx.fillStyle = 'rgba(242,235,221,0.93)';
+    roundRect(r.x, r.y, r.w, r.h, 6); ctx.fill();
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 2;
+    roundRect(r.x, r.y, r.w, r.h, 6); ctx.stroke();
+    // 键位角标
+    ctx.beginPath();
+    ctx.fillStyle = VERMILION;
+    ctx.arc(r.x + 18, r.y + 18, 11, 0, TAU); ctx.fill();
+    ctx.fillStyle = PAPER;
+    ctx.font = '600 13px "STKaiti","KaiTi",serif';
+    ctx.fillText(String(i + 1), r.x + 18, r.y + 19);
+    // 词条名 / 说明
+    ctx.fillStyle = INK;
+    ctx.font = '700 21px "STKaiti","KaiTi",serif';
+    ctx.fillText(perk.name, r.x + r.w / 2, r.y + 58);
+    ctx.fillStyle = 'rgba(27,27,32,0.72)';
+    ctx.font = '14px "STKaiti","KaiTi",serif';
+    ctx.fillText(perk.desc, r.x + r.w / 2, r.y + 96);
+    if (i === 0) {                                   // 首项是超时默认项，标注一下
+      ctx.fillStyle = 'rgba(191,58,43,0.85)';
+      ctx.font = '12px "STKaiti","KaiTi",serif';
+      ctx.fillText('超时默认', r.x + r.w / 2, r.y + 126);
+    }
+    ctx.restore();
+  }
+  // 倒计时条
+  const bw = (W - 32), bx = PERK_CARD_X0, by = PERK_CARD_Y + PERK_CARD_H + 14;
+  ctx.strokeStyle = 'rgba(27,27,32,0.6)';
+  ctx.lineWidth = 2;
+  roundRect(bx, by, bw, 6, 3); ctx.stroke();
+  ctx.fillStyle = VERMILION;
+  roundRect(bx + 2, by + 2, (bw - 4) * clamp(pc.t / PERK_TIME, 0, 1), 2, 1); ctx.fill();
+  ctx.fillStyle = 'rgba(27,27,32,0.72)';
+  ctx.font = '12px "STKaiti","KaiTi",serif';
+  ctx.fillText('数字键 / 点击选择 · ' + Math.ceil(Math.max(0, pc.t)) + 's', W / 2, by + 22);
+  ctx.restore();
 }
 
 function drawOverlay() {
@@ -1750,13 +1900,17 @@ function render() {
   ctx.restore();
   drawFlashes();
   drawHUD();
-  if (state === 'playing') drawBossUI();
+  if (state === 'playing') { drawBossUI(); if (perkChoice) drawPerkChoice(); }
   if (state === 'garage') drawGarage();
   else drawOverlay();
 }
 
 /* ============================== 流程控制 ============================== */
 function onMeta(code) {
+  if (perkChoice && code.indexOf('Digit') === 0) {     // 选词条：1/2/3 手不离 WASD 直接选
+    const i = parseInt(code.slice(5), 10) - 1;
+    if (i >= 0 && i < perkChoice.options.length) { applyPerk(i); return; }
+  }
   if (code === 'Escape') {
     if (state === 'playing') state = 'paused';
     else if (state === 'paused') state = 'playing';
@@ -1798,6 +1952,7 @@ function startGame() {
   bombCharge = 0;
   laserSound = 0;
   touchActive = false; touchId = null;
+  perkChoice = null;
   themeIndex = Math.floor(Math.random() * THEMES.length);
   rebuildAmbient();
   state = 'playing';
@@ -1809,10 +1964,16 @@ function frame(now) {
   let dt = (now - last) / 1000;
   last = now;
   dt = Math.min(dt, 1 / 30);
+  const choosing = !!perkChoice && state === 'playing';
+  if (choosing) {                                    // 选词条：按真实时间倒计时，超时自动取首项
+    perkChoice.t -= dt;
+    if (perkChoice.t <= 0) applyPerk(0);
+  }
+  const gdt = choosing ? dt * PERK_SLOW : dt;        // 游戏逻辑放慢，而不是暂停
   if (hitstop > 0) { hitstop -= dt; }
-  else { update(dt); }
-  updateMist(dt);
-  updateAmbient(dt);
+  else { update(gdt); }
+  updateMist(gdt);
+  updateAmbient(gdt);
   render();
   requestAnimationFrame(frame);
 }
